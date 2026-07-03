@@ -1,0 +1,12 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# training artifacts
+checkpoints/
+runs/
+
+# frontend
+frontend/node_modules/
+frontend/dist/

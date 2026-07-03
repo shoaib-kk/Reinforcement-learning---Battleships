@@ -1,0 +1,5 @@
+# CPU torch is enough; for CUDA install per https://pytorch.org
+torch>=2.2
+numpy>=1.26
+fastapi>=0.110
+uvicorn[standard]>=0.29
