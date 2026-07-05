@@ -10,6 +10,7 @@ import {
   NetworkDiagram,
   WeightHists,
 } from "./components/NetworkInternals";
+import NetworkViz3D from "./NetworkViz3D/NetworkViz3D";
 import type {
   BoardState,
   EpisodeRecord,
@@ -20,7 +21,7 @@ import type {
 } from "./types";
 
 type Mode = "train" | "demo";
-type Tab = "dashboard" | "network";
+type Tab = "dashboard" | "network" | "viz3d";
 
 const EMPTY_GRID: number[][] = Array.from({ length: 10 }, () => Array(10).fill(0));
 
@@ -31,9 +32,9 @@ function cellName(action: number | undefined): string {
 
 export default function App() {
   const [mode, setMode] = useState<Mode>("train");
-  // deep-linkable tab: /#network opens the internals view directly
+  // deep-linkable tabs: /#network and /#3d open those views directly
   const [tab, setTab] = useState<Tab>(() =>
-    location.hash === "#network" ? "network" : "dashboard"
+    location.hash === "#network" ? "network" : location.hash === "#3d" ? "viz3d" : "dashboard"
   );
   const [overlay, setOverlay] = useState<OverlayMode>("q");
   const [status, setStatus] = useState<TrainStatus | null>(null);
@@ -220,10 +221,21 @@ export default function App() {
             >
               Network internals
             </button>
+            <button
+              className={tab === "viz3d" ? "active" : ""}
+              onClick={() => {
+                setTab("viz3d");
+                history.replaceState(null, "", "#3d");
+              }}
+            >
+              3D network
+            </button>
           </div>
 
           {tab === "dashboard" ? (
             <MetricsDashboard records={records} status={status} />
+          ) : tab === "viz3d" ? (
+            <NetworkViz3D payload={current} mode={mode} staticKey={`${mode}:${demoSource}`} />
           ) : (
             <>
               <div className="card">

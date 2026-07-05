@@ -38,6 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from agent import viz3d
 from agent.model import DQN
 from agent.trainer import Trainer, TrainConfig
 from server.demo import DemoGame
@@ -190,10 +191,25 @@ async def train_status() -> dict:
 
 @app.post("/api/stream/config")
 async def stream_config(body: dict) -> dict:
-    n = int(body.get("viz_every", 20))
-    if state.trainer:
-        state.trainer.set_viz_every(n)
-    return {"ok": True, "viz_every": max(1, n)}
+    """Stream throttles. viz_every gates board/2D messages (in env steps);
+    viz3d/viz3d_every gate the heavier 3D tensors independently (in emitted
+    messages), so the 3D feed can be thinned without slowing the board."""
+    out: dict = {"ok": True}
+    if "viz_every" in body:
+        n = max(1, int(body["viz_every"]))
+        if state.trainer:
+            state.trainer.set_viz_every(n)
+        out["viz_every"] = n
+    if "viz3d" in body or "viz3d_every" in body:
+        enabled = body.get("viz3d")
+        every = body.get("viz3d_every")
+        if state.trainer:
+            state.trainer.set_viz3d(enabled, every)
+        if enabled is not None:
+            out["viz3d"] = bool(enabled)
+        if every is not None:
+            out["viz3d_every"] = max(1, int(every))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -265,6 +281,25 @@ async def embeddings(n: int = 400) -> dict:
     with state.trainer.lock:
         return embedding_projection(
             state.trainer.model, state.trainer.buffer, n=n, device=state.trainer.device
+        )
+
+
+@app.get("/api/viz3d/static")
+async def viz3d_static(model: str = "train") -> dict:
+    """Per-model static data for the 3D scene: layer topology + the head
+    weight matrix. Sent once per model load / checkpoint change — the
+    frontend refetches when model_version changes, not per step."""
+    if model == "demo":
+        state.demo.ensure_model()
+        with state.demo_lock:
+            return viz3d.static_payload(state.demo.model, f"demo:{state.demo.source}")
+    if not state.trainer:
+        state.demo.ensure_model()
+        with state.demo_lock:
+            return viz3d.static_payload(state.demo.model, "fresh")
+    with state.trainer.lock:
+        return viz3d.static_payload(
+            state.trainer.model, f"trainer:step{state.trainer.total_steps}"
         )
 
 

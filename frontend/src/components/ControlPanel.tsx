@@ -196,7 +196,7 @@ export default function ControlPanel({ status, onStatus, onDemoPayload, onDemoRe
           onChange={(e) => {
             const n = Number(e.target.value);
             setVizEvery(n);
-            api.streamConfig(n).catch(() => {});
+            api.streamConfig({ viz_every: n }).catch(() => {});
           }}
         />
         <span className="hint">{vizEvery} steps</span>

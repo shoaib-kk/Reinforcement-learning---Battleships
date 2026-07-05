@@ -14,6 +14,7 @@ import time
 import numpy as np
 import torch
 
+from agent import viz3d
 from agent.model import DQN
 from agent.opponents import make_opponent
 from agent.trainer import activation_payload, round_list
@@ -83,6 +84,9 @@ class DemoGame:
         masked = np.where(self.mask, q_np, -np.inf)
         action = int(np.argmax(masked))
         saliency = self.model.saliency(x, action)
+        # 3D scene data for this exact forward pass (demo = inference mode,
+        # so there are never gradients here).
+        payload_3d = viz3d.forward_payload(self.model, self.obs, acts)
 
         obs2, reward, done, info = self.env.step(action)
         payload = {
@@ -100,6 +104,7 @@ class DemoGame:
             ],
             "saliency": [round_list(row) for row in saliency],
             "activations": activation_payload(acts),
+            "viz3d": payload_3d,
             "board": self.env.get_render_state(),
         }
         self.history.append(payload)

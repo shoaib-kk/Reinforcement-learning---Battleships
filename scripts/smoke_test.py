@@ -92,6 +92,59 @@ def test_model_and_introspection():
     print("  model introspection ok —", sum(l["params"] for l in arch), "params")
 
 
+def test_viz3d():
+    """The 3D feed must be exact: quantization error bounded, and the edge
+    'contribution' matrices must literally sum to the next layer's
+    pre-activation (minus bias) — that's what makes the viz verifiable."""
+    import base64
+
+    import torch
+    from agent import viz3d
+    from agent.model import DQN
+
+    def dec(t):
+        raw = np.frombuffer(base64.b64decode(t["b64"]), dtype=np.int8)
+        return (raw.astype(np.float32) * t["scale"] / 127).reshape(t["shape"])
+
+    m = DQN(in_channels=3)
+    x = torch.rand(1, 3, 10, 10)
+    q, acts = m.forward_with_activations(x)
+    p = viz3d.forward_payload(m, x[0].numpy(), acts)
+
+    # quantization round-trip within one int8 step
+    head = dec(p["layers"]["head"])
+    assert head.shape == (100,)
+    assert np.max(np.abs(head - q[0].numpy())) <= p["layers"]["head"]["scale"] / 127
+    assert dec(p["contrib"]["conv3_fc1"]).shape == (64, 512)
+    assert dec(p["contrib"]["fc1_head"]).shape == (100, 512)
+
+    # exactness (float, pre-quantization): contributions + bias == pre-act
+    a3 = torch.relu(acts["conv3"][0]).reshape(64, -1)
+    w1 = m.fc1.weight.view(512, 64, -1)
+    contrib = torch.einsum("jmp,mp->mj", w1, a3)
+    assert torch.allclose(contrib.sum(0) + m.fc1.bias, acts["fc1"][0], atol=1e-4)
+    contrib2 = torch.relu(acts["fc1"][0]).unsqueeze(0) * m.head.weight
+    assert torch.allclose(contrib2.sum(1) + m.head.bias, acts["head"][0], atol=1e-4)
+
+    # a ReLU-dead fc1 unit must produce an all-zero outgoing edge row
+    dead = (acts["fc1"][0] <= 0).nonzero()
+    if len(dead):
+        assert contrib2[:, dead[0, 0]].abs().max() == 0
+
+    # gradients from a real backward pass
+    m.zero_grad()
+    m(x).sum().backward()
+    g = viz3d.grad_payload(m)
+    assert g is not None and dec(g["fc1_head"]).shape == (100, 512)
+    assert dec(g["conv3_fc1"]).shape == (64, 512)
+    assert set(g["conv_mags"]) == {"conv1", "conv2", "conv3"}
+
+    st = viz3d.static_payload(m, "test")
+    assert dec(st["head_weights"]).shape == (100, 512)
+    assert st["topology"][0]["name"] == "input"
+    print("  viz3d ok — contributions reconstruct pre-activations exactly")
+
+
 def test_training_and_demo():
     import json
     import tempfile
@@ -128,6 +181,10 @@ def test_training_and_demo():
         json.dumps(step)  # payload must be JSON-serializable
         assert len(step["q_values"]) == 100
         assert step["activations"]["conv1"]["kind"] == "conv"
+        assert "viz3d" in step and "conv3_fc1" in step["viz3d"]["contrib"]
+        # gradients appear once the optimizer has run
+        grad_steps = [e for e in events if e["type"] == "train_step" and "grads" in e.get("viz3d", {})]
+        assert grad_steps, "no train_step carried gradients"
 
         # checkpoint -> demo game
         path = tr.save_checkpoint()
@@ -138,6 +195,8 @@ def test_training_and_demo():
             p = demo.step()
         json.dumps(p)
         assert len(p["saliency"]) == 10 and len(p["q_values"]) == 100
+        assert "viz3d" in p and "grads" not in p["viz3d"]  # demo = inference only
+        json.dumps(p)
         assert demo.export()["n_steps"] == 5
 
         # embeddings from the real buffer
@@ -156,5 +215,6 @@ if __name__ == "__main__":
     test_env()
     test_hunt_target_efficiency()
     test_model_and_introspection()
+    test_viz3d()
     test_training_and_demo()
     print("ALL SMOKE TESTS PASSED")

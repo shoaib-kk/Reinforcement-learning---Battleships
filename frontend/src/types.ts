@@ -28,6 +28,35 @@ export interface DenseActivation {
 }
 export type Activations = Record<string, ConvActivation | DenseActivation>;
 
+/** Symmetric int8 quantized tensor: value ≈ int8 / 127 * scale.
+ *  `scale` is exactly max|value| of the original array. */
+export interface Q8Tensor {
+  shape: number[];
+  scale: number;
+  b64: string;
+}
+
+export interface Viz3DGrads {
+  conv3_fc1: Q8Tensor; // (64, 512)  Σ|∂L/∂W1| per (map, fc1-unit) connection
+  fc1_head: Q8Tensor;  // (100, 512) ∂L/∂W2 per (head, fc1-unit) connection
+  conv_mags: Record<string, Q8Tensor>; // per-out-channel |grad| mass
+}
+
+export interface Viz3DStep {
+  layers: Record<string, Q8Tensor>; // input + pre-ReLU module outputs
+  contrib: {
+    conv3_fc1: Q8Tensor; // (64, 512)  Σ_p W1[j,m,p]·relu(conv3[m,p])
+    fc1_head: Q8Tensor;  // (100, 512) relu(fc1[i])·W2[j,i]
+  };
+  grads?: Viz3DGrads; // present on training steps once the optimizer has run
+}
+
+export interface Viz3DStatic {
+  model_version: string;
+  topology: ArchLayer[];
+  head_weights: Q8Tensor; // (100, 512) — static wireframe option
+}
+
 export interface StepPayload {
   type: "train_step" | "demo_step";
   step: number;
@@ -42,6 +71,7 @@ export interface StepPayload {
   q_values: (number | null)[];
   saliency?: number[][];
   activations: Activations;
+  viz3d?: Viz3DStep;
   board: BoardState;
   error?: string;
 }

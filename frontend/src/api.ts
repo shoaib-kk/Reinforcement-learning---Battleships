@@ -7,6 +7,7 @@ import type {
   LayerHistograms,
   StepPayload,
   TrainStatus,
+  Viz3DStatic,
 } from "./types";
 
 async function post<T>(url: string, body?: unknown): Promise<T> {
@@ -29,7 +30,10 @@ export const api = {
   trainStart: (cfg: Record<string, unknown>) => post<TrainStatus>("/api/train/start", cfg),
   trainStop: () => post<TrainStatus>("/api/train/stop"),
   trainStatus: () => get<TrainStatus>("/api/train/status"),
-  streamConfig: (vizEvery: number) => post("/api/stream/config", { viz_every: vizEvery }),
+  streamConfig: (cfg: { viz_every?: number; viz3d?: boolean; viz3d_every?: number }) =>
+    post("/api/stream/config", cfg),
+  viz3dStatic: (model: "train" | "demo") =>
+    get<Viz3DStatic>(`/api/viz3d/static?model=${model}`),
   metrics: (after = 0) =>
     get<{ total: number; records: EpisodeRecord[] }>(`/api/metrics?after=${after}`),
   checkpoints: () =>

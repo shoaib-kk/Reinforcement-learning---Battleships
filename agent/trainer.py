@@ -39,6 +39,7 @@ from env.battleship_env import BattleshipEnv, BOARD_SIZE, N_CELLS
 from .model import DQN
 from .opponents import make_opponent
 from .replay_buffer import ReplayBuffer, OUTCOME_WIN, OUTCOME_LOSS
+from . import viz3d
 
 
 @dataclass
@@ -59,6 +60,8 @@ class TrainConfig:
     checkpoint_every: int = 200       # episodes
     hist_every: int = 25              # episodes between weight-histogram events
     viz_every: int = 20               # steps between live train_step events
+    viz3d: bool = True                # attach 3D-scene tensors to the stream
+    viz3d_every: int = 1              # every Nth train_step also carries 3D data
     self_play_sync: int = 200         # episodes between frozen-opponent refreshes
     grad_clip: float = 10.0
     seed: int | None = None
@@ -138,6 +141,7 @@ class Trainer:
 
         self.episode = 0
         self.total_steps = 0
+        self._viz_msg_count = 0
         self.metrics: list[dict] = []
         self._win_hist: dict[str, deque] = {}
         self._shots_hist: deque = deque(maxlen=100)
@@ -148,6 +152,13 @@ class Trainer:
     def set_viz_every(self, n: int) -> None:
         """Live stream speed control (called from the server thread)."""
         self.cfg.viz_every = max(1, int(n))
+
+    def set_viz3d(self, enabled: bool | None = None, every: int | None = None) -> None:
+        """Separate throttle for the (heavier) 3D tensor stream."""
+        if enabled is not None:
+            self.cfg.viz3d = bool(enabled)
+        if every is not None:
+            self.cfg.viz3d_every = max(1, int(every))
 
     def status(self) -> dict:
         return {
@@ -312,23 +323,34 @@ class Trainer:
         q_json = [
             round(float(v), 3) if legal else None for v, legal in zip(q_np, mask)
         ]
+        payload_3d = None
+        self._viz_msg_count += 1
+        want_3d = self.cfg.viz3d and self._viz_msg_count % self.cfg.viz3d_every == 0
         with self.lock:
             _, acts = self.model.forward_with_activations(
                 torch.from_numpy(obs).unsqueeze(0).to(self.device)
             )
-        self.emit(
-            {
-                "type": "train_step",
-                "episode": self.episode,
-                "step": self.total_steps,
-                "epsilon": round(eps, 4),
-                "action": int(action),
-                "result": info["result"],
-                "q_values": q_json,
-                "board": self.env.get_render_state(),
-                "activations": activation_payload(acts),
-            }
-        )
+            if want_3d:
+                # Same captured pass that produced `acts`; contributions are
+                # computed against the current weights, so nothing is stale.
+                payload_3d = viz3d.forward_payload(self.model, obs, acts)
+                grads = viz3d.grad_payload(self.model)  # latest optimize step
+                if grads is not None:
+                    payload_3d["grads"] = grads
+        msg = {
+            "type": "train_step",
+            "episode": self.episode,
+            "step": self.total_steps,
+            "epsilon": round(eps, 4),
+            "action": int(action),
+            "result": info["result"],
+            "q_values": q_json,
+            "board": self.env.get_render_state(),
+            "activations": activation_payload(acts),
+        }
+        if payload_3d is not None:
+            msg["viz3d"] = payload_3d
+        self.emit(msg)
 
     def _emit_weight_histograms(self) -> None:
         with self.lock:
