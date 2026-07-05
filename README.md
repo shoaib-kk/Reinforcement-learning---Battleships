@@ -110,7 +110,8 @@ step being shown; nothing is a decorative loop:**
 | Plane border color | inference: per-map mean of positive (post-ReLU) activation this step; gradient mode: per-out-channel Σ\|∂L/∂W\| of that conv kernel from the latest optimizer step |
 | Dense node hue (fc1 / head) | **sign of the pre-activation** (fc1: fired vs ReLU-suppressed; head: sign of the Q-value) |
 | Dense node brightness & size | \|pre-activation\| / layer max for this pass — a unit at 0 stays small and dark |
-| Edge existence & line brightness | the **exact contribution** flowing on that connection: conv3→fc1 edge (m→j) = Σ_p W1[j,m,p]·relu(conv3[m,p]); fc1→head edge (i→j) = relu(fc1[i])·W2[j,i]. These summands literally add up (plus bias) to the target's pre-activation — verified in `scripts/smoke_test.py::test_viz3d` |
+| Edge existence, line width & brightness | the **exact contribution** flowing on that connection: conv3→fc1 edge (m→j) = Σ_p W1[j,m,p]·relu(conv3[m,p]); fc1→head edge (i→j) = relu(fc1[i])·W2[j,i]. These summands literally add up (plus bias) to the target's pre-activation — verified in `scripts/smoke_test.py::test_viz3d` |
+| Hover tooltip | the raw decoded value behind whatever is under the pointer — a Q-value, an fc1 pre-activation, a feature-map cell, or a single edge's contribution/gradient |
 | Particle size & speed | \|contribution\| of that edge, normalized by the step's max |
 | Particle color | sign of the contribution (warm +, cool −) |
 | Particle direction | forward (source→target) in inference mode; **reversed** in gradient mode |
@@ -132,10 +133,18 @@ the *current* weights every step, so nothing goes stale while training
 mutates the network. The 3D feed has its own throttle (`viz3d_every` in
 `POST /api/stream/config`, or the "stream 3D every" control), independent of
 the 2D board stream, plus a client-side "apply every Nth update" control and
-a per-layer focus/LOD selector. Connection filtering defaults to the top-k
-(k=6, configurable 1–12) strongest active connections per target neuron
-above a minimum-magnitude threshold; "all connections" lifts the k limit
-(still magnitude-capped at the 4,096-edge pool).
+a per-layer focus/LOD selector. Connection filtering keeps the top-k (k=4,
+configurable 1–12) strongest active connections per target neuron,
+intersected with a global "edge budget" of the N strongest edges in the
+matrix (default 256) — rank-based, so visual density stays stable whether
+the weights are flat (early training) or spiky (one dominant unit).
+Selection has a 3-step hysteresis so borderline edges don't flicker in and
+out (values shown are always the current ones; an edge whose contribution
+hits exactly 0 still vanishes instantly). "All connections" lifts both
+limits (still capped at the 4,096-edge pool). Hover any node, feature-map
+cell or connection to read the exact value it renders; click a Q-head node
+to isolate the edge paths that produced that Q-value (click empty space to
+clear). Panel settings persist in localStorage.
 
 **Modes:** *Inference* shows the forward pass that chose the current move
 (works for live training and demo). *Gradients* replays the same geometry

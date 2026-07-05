@@ -7,7 +7,11 @@
 // color all come from the actual (activation × weight) contribution (or
 // weight gradient, in gradient mode) it represents. A ReLU-dead neuron has
 // contribution exactly 0 on every outgoing edge, so it gets no particles
-// and stays dark by construction.
+// and stays dark by construction. Hovering any node, feature-map cell or
+// connection shows the exact number it renders; clicking a head node
+// isolates the edge paths that produced that Q-value. Edge *selection* has
+// a small hysteresis to stop top-k churn from flickering, but a kept edge
+// always renders its current true value.
 //
 // Performance: all geometry is pooled and preallocated once per model
 // topology (plane textures, node InstancedMeshes, edge/particle buffers
@@ -17,6 +21,13 @@
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
+import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 import { decodeQ8 } from "./decode";
 import type { ArchLayer, Q8Tensor, Viz3DStatic, Viz3DStep } from "../types";
 
@@ -39,22 +50,53 @@ function diverge(t: number, out: { r: number; g: number; b: number }) {
 export interface SceneOptions {
   mode: "inference" | "gradients";
   k: number;           // top-k strongest connections per target neuron
-  threshold: number;   // min |value| as a fraction of the matrix max
-  showAll: boolean;    // ignore k, keep threshold (still capped by pool)
+  topN: number;        // global budget: the N strongest edges kept per matrix
+  showAll: boolean;    // ignore k and topN (still capped by pool)
   weightWireframe: boolean; // static head-weight wires (from /api/viz3d/static)
   focus: string;       // all | input | conv1 | conv2 | conv3 | dense
 }
 
 export const DEFAULT_OPTIONS: SceneOptions = {
   mode: "inference",
-  k: 6,
-  threshold: 0.05,
+  k: 4,
+  topN: 256,
   showAll: false,
   weightWireframe: false,
   focus: "all",
 };
 
 const MAX_EDGES = 4096; // per edge set (pool size)
+const NOISE_FRAC = 0.02; // below ~2.5 q8 LSB of the matrix scale: quantization noise, never drawn
+const HYST_MISSES = 3;   // steps an edge must miss the selection before dropping (anti-flicker)
+const FOCUS_K = 32;      // per-target k while a head node is focused (one target => show more)
+
+/** Board cell name for a 0-99 head/board index (column letter + 1-based row). */
+function cellLabel(i: number): string {
+  return `${"ABCDEFGHIJ"[i % 10]}${Math.floor(i / 10) + 1}`;
+}
+
+// what each input plane encodes (env/battleship_env.py `_obs`)
+const CHANNEL_NAMES = ["not fired yet", "hits", "misses", "own ships"];
+
+// one-line role of each layer, shown under its name in the scene
+const LAYER_ROLES: Record<string, string> = {
+  input: "the agent's view of the board",
+  conv1: "3×3 detectors scan for local patterns",
+  conv2: "combines patterns into shapes",
+  conv3: "high-level board features",
+  fc1: "mixes all positions into 512 features",
+  head: "expected value of firing each cell",
+};
+
+function fmt(v: number): string {
+  return Math.abs(v) >= 1e-4 || v === 0 ? v.toFixed(3) : v.toExponential(2);
+}
+
+interface EdgePick {
+  s: number; // source neuron index
+  t: number; // target neuron index
+  v: number; // the actual contribution (or gradient) on that edge
+}
 const PLANE = 2.4;      // feature-map plane size
 const LAYER_Z: Record<string, number> = {
   input: 0, conv1: 9, conv2: 18, conv3: 27, fc1: 38, head: 50,
@@ -70,6 +112,7 @@ interface PlaneLayer {
   frame: THREE.LineSegments; // per-map border, color = real per-map aggregate
   frameColors: Float32Array;
   group: THREE.Group;
+  values: Float32Array; // decoded (n*100) values of the bound step, for hover
 }
 
 interface NodeLayer {
@@ -78,12 +121,17 @@ interface NodeLayer {
   mesh: THREE.InstancedMesh;
   positions: Float32Array; // (n*3)
   group: THREE.Group;
+  values: Float32Array; // decoded per-unit values of the bound step, for hover
 }
 
 interface EdgeSet {
-  lines: THREE.LineSegments;
-  linePos: Float32Array;
-  lineCol: Float32Array;
+  lines: LineSegments2;
+  linePos: Float32Array;   // interleaved (start.xyz, end.xyz) per edge
+  lineCol: Float32Array;   // interleaved (startColor, endColor) per edge
+  lineWidth: Float32Array; // per-edge world-units width = |contribution|
+  linePosBuf: THREE.InstancedInterleavedBuffer;
+  lineColBuf: THREE.InstancedInterleavedBuffer;
+  lineWidthAttr: THREE.InstancedBufferAttribute;
   points: THREE.Points;
   pStart: Float32Array;
   pEnd: Float32Array;
@@ -92,6 +140,9 @@ interface EdgeSet {
   pSpeed: Float32Array;
   pPhase: Float32Array;
   count: number;
+  meta: EdgePick[];            // per rendered edge, for the hover readout
+  sticky: Map<number, number>; // edge key (t*nS+s) -> consecutive misses
+  grad: boolean;               // whether the current binding is gradient data
 }
 
 const PARTICLE_VERT = `
@@ -121,8 +172,38 @@ const PARTICLE_FRAG = `
   }
 `;
 
+// Per-pixel brightness cap for the additive particles: identity below the
+// luminance knee, Reinhard-compressed above it. Overshooting channels are
+// rescaled (not clamped) so dense pile-ups saturate at the palette hue at
+// full brightness instead of fusing to white.
+const TONEMAP_SHADER = {
+  uniforms: { tDiffuse: { value: null as THREE.Texture | null } },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    varying vec2 vUv;
+    void main() {
+      vec4 c = texture2D(tDiffuse, vUv);
+      float l = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float knee = 0.7;
+      float room = 0.3; // luminance asymptotes at knee + room
+      float cl = l <= knee ? l : knee + (l - knee) / (1.0 + (l - knee) / room);
+      vec3 o = c.rgb * (cl / max(l, 1e-5));
+      float m = max(o.r, max(o.g, o.b));
+      gl_FragColor = vec4(m > 1.0 ? o / m : o, c.a);
+    }
+  `,
+};
+
 export class NetScene {
   private renderer: THREE.WebGLRenderer;
+  private composer: EffectComposer;
   private scene = new THREE.Scene();
   private camera: THREE.PerspectiveCamera;
   private controls: OrbitControls;
@@ -148,6 +229,19 @@ export class NetScene {
   private tmp = { r: 0, g: 0, b: 0 };
   private dummy = new THREE.Object3D();
 
+  // hover readout & click-to-trace
+  private raycaster = new THREE.Raycaster();
+  private pointerNdc = new THREE.Vector2();
+  private pointerPx = { x: 0, y: 0 };
+  private pointerMoved = false;
+  private downAt: { x: number; y: number } | null = null;
+  private tooltip: HTMLDivElement;
+  private focusLabel: HTMLDivElement;
+  private focusHead = -1; // head unit whose input edges are isolated (click)
+
+  /** Edge count readout for the panel, called after every (re)bind. */
+  onStats?: (edges: number) => void;
+
   constructor(private container: HTMLElement) {
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -161,6 +255,54 @@ export class NetScene {
     this.controls.target.set(0, 0, 25);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
+
+    // HDR target (MSAA to keep line antialiasing) -> luminance cap -> sRGB out
+    const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+    const target = new THREE.WebGLRenderTarget(size.x, size.y, {
+      type: THREE.HalfFloatType,
+      samples: 4,
+    });
+    this.composer = new EffectComposer(this.renderer, target);
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    this.composer.addPass(new ShaderPass(TONEMAP_SHADER));
+    this.composer.addPass(new OutputPass());
+
+    // depth cue: distant layers fade toward the background. Particles are a
+    // fog-less ShaderMaterial on purpose — the pulses stay readable at depth.
+    this.scene.fog = new THREE.Fog(BG, 90, 260);
+
+    this.tooltip = document.createElement("div");
+    this.tooltip.className = "viz3d-tooltip";
+    container.appendChild(this.tooltip);
+    this.focusLabel = document.createElement("div");
+    this.focusLabel.className = "viz3d-focus";
+    container.appendChild(this.focusLabel);
+
+    (this.raycaster.params as { Line2?: { threshold: number } }).Line2 = { threshold: 0.12 };
+    const el = this.renderer.domElement;
+    el.addEventListener("pointermove", (e) => {
+      const rect = el.getBoundingClientRect();
+      this.pointerPx.x = e.clientX - rect.left;
+      this.pointerPx.y = e.clientY - rect.top;
+      this.pointerNdc.set(
+        (this.pointerPx.x / rect.width) * 2 - 1,
+        -(this.pointerPx.y / rect.height) * 2 + 1
+      );
+      this.pointerMoved = true;
+    });
+    el.addEventListener("pointerleave", () => {
+      this.pointerMoved = false;
+      this.tooltip.style.display = "none";
+    });
+    el.addEventListener("pointerdown", (e) => {
+      this.downAt = { x: e.clientX, y: e.clientY };
+    });
+    el.addEventListener("pointerup", (e) => {
+      const d = this.downAt;
+      this.downAt = null;
+      // a click, not an orbit/pan drag
+      if (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) < 6) this.handleClick();
+    });
 
     this.scene.add(this.denseGroup);
     this.resize();
@@ -184,14 +326,18 @@ export class NetScene {
       else if (mat) mat.dispose();
     });
     this.planes.forEach((p) => p.textures.forEach((t) => t.dispose()));
+    this.composer.dispose();
     this.renderer.dispose();
     this.container.removeChild(this.renderer.domElement);
+    this.container.removeChild(this.tooltip);
+    this.container.removeChild(this.focusLabel);
   }
 
   private resize() {
     const w = this.container.clientWidth || 800;
     const h = this.container.clientHeight || 560;
     this.renderer.setSize(w, h);
+    this.composer.setSize(w, h);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
   }
@@ -201,7 +347,11 @@ export class NetScene {
     this.raf = requestAnimationFrame(this.animate);
     this.timeUniform.value += this.clock.getDelta();
     this.controls.update();
-    this.renderer.render(this.scene, this.camera);
+    if (this.pointerMoved && this.built) {
+      this.pointerMoved = false; // raycast at most once per rendered frame
+      this.updateHover();
+    }
+    this.composer.render();
   };
 
   // -- build (once per topology) -------------------------------------------
@@ -266,6 +416,7 @@ export class NetScene {
       tex.minFilter = THREE.NearestFilter;
       const mat = new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide });
       const mesh = new THREE.Mesh(geo, mat);
+      mesh.userData = { plane: name, map: i }; // hover readout looks this up
       const r = Math.floor(i / cols);
       const c = i % cols;
       const x = (c - (cols - 1) / 2) * pitch;
@@ -297,8 +448,22 @@ export class NetScene {
     );
     frame.frustumCulled = false;
     group.add(frame);
+    // the input planes get a caption naming what each channel encodes
+    if (name === "input") {
+      for (let i = 0; i < n; i++) {
+        const cap = this.textSprite(
+          [{ text: CHANNEL_NAMES[i] ?? `channel ${i}`, font: "18px system-ui, sans-serif", fill: "#898781", y: 24 }],
+          160, 36, 2.6
+        );
+        cap.position.set(centers[i * 3], centers[i * 3 + 1] - PLANE / 2 - 0.5, z);
+        group.add(cap);
+      }
+    }
     this.scene.add(group);
-    return { name, n, meshes, textures, texData, centers, frame, frameColors, group };
+    return {
+      name, n, meshes, textures, texData, centers, frame, frameColors, group,
+      values: new Float32Array(n * 100),
+    };
   }
 
   private buildNodeLayer(
@@ -323,26 +488,57 @@ export class NetScene {
       mesh.setColorAt(i, new THREE.Color(DIM.r, DIM.g, DIM.b));
     }
     group.add(mesh);
-    return { name, n, mesh, positions, group };
+    return { name, n, mesh, positions, group, values: new Float32Array(n) };
   }
 
   private buildEdgeSet(): EdgeSet {
-    const linePos = new Float32Array(MAX_EDGES * 2 * 3);
-    const lineCol = new Float32Array(MAX_EDGES * 2 * 3);
-    const lineGeo = new THREE.BufferGeometry();
-    lineGeo.setAttribute("position", new THREE.BufferAttribute(linePos, 3));
-    lineGeo.setAttribute("color", new THREE.BufferAttribute(lineCol, 3));
-    lineGeo.setDrawRange(0, 0);
-    const lines = new THREE.LineSegments(
-      lineGeo,
-      new THREE.LineBasicMaterial({
-        vertexColors: true,
-        transparent: true,
-        opacity: 0.42,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      })
-    );
+    const linePos = new Float32Array(MAX_EDGES * 6);
+    const lineCol = new Float32Array(MAX_EDGES * 6);
+    const lineWidth = new Float32Array(MAX_EDGES);
+    const lineGeo = new LineSegmentsGeometry();
+    lineGeo.setPositions(linePos); // wraps (not copies) — rewritten in place per step
+    lineGeo.setColors(lineCol);
+    lineGeo.setAttribute("linewidth", new THREE.InstancedBufferAttribute(lineWidth, 1));
+    lineGeo.instanceCount = 0;
+    // constant generous bound (raycast early-out only) — content never leaves it
+    lineGeo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 25), 250);
+    const linePosBuf = (lineGeo.getAttribute("instanceStart") as THREE.InterleavedBufferAttribute)
+      .data as THREE.InstancedInterleavedBuffer;
+    const lineColBuf = (lineGeo.getAttribute("instanceColorStart") as THREE.InterleavedBufferAttribute)
+      .data as THREE.InstancedInterleavedBuffer;
+    const lineWidthAttr = lineGeo.getAttribute("linewidth") as THREE.InstancedBufferAttribute;
+    linePosBuf.setUsage(THREE.DynamicDrawUsage);
+    lineColBuf.setUsage(THREE.DynamicDrawUsage);
+    lineWidthAttr.setUsage(THREE.DynamicDrawUsage);
+
+    // Fat lines so |contribution| maps to *width* (native GPU line width is
+    // 1px on most Windows drivers, so LineBasicMaterial can't encode it).
+    // Normal alpha blending on purpose: overlapping lines converge toward
+    // their own color and can never stack past this fixed opacity. Additive
+    // glow is reserved for the traveling pulse particles below.
+    const lineMat = new LineMaterial({
+      vertexColors: true,
+      worldUnits: true,
+      linewidth: 0.2, // raycast tolerance only; drawing reads the per-edge attribute
+      transparent: true,
+      opacity: 0.55,
+      depthWrite: false,
+      fog: true,
+    });
+    // Per-edge width: swap the linewidth uniform for our instanced attribute.
+    // The fragment stage (WORLD_UNITS path) also reads it, via a varying.
+    lineMat.onBeforeCompile = (shader) => {
+      shader.vertexShader = shader.vertexShader
+        .replace(
+          "uniform float linewidth;",
+          "attribute float linewidth;\nvarying float vLinewidth;"
+        )
+        .replace("void main() {", "void main() {\n\tvLinewidth = linewidth;");
+      shader.fragmentShader = shader.fragmentShader
+        .replace(/\blinewidth\b/g, "vLinewidth")
+        .replace("uniform float vLinewidth;", "varying float vLinewidth;");
+    };
+    const lines = new LineSegments2(lineGeo, lineMat);
     lines.frustumCulled = false;
 
     const pStart = new Float32Array(MAX_EDGES * 3);
@@ -372,7 +568,11 @@ export class NetScene {
     );
     points.frustumCulled = false;
     this.denseGroup.add(lines, points);
-    return { lines, linePos, lineCol, points, pStart, pEnd, pCol, pSize, pSpeed, pPhase, count: 0 };
+    return {
+      lines, linePos, lineCol, lineWidth, linePosBuf, lineColBuf, lineWidthAttr,
+      points, pStart, pEnd, pCol, pSize, pSpeed, pPhase,
+      count: 0, meta: [], sticky: new Map(), grad: false,
+    };
   }
 
   private buildWireframe(weights: Q8Tensor) {
@@ -410,8 +610,7 @@ export class NetScene {
     this.wireframe = new THREE.LineSegments(
       geo,
       new THREE.LineBasicMaterial({
-        vertexColors: true, transparent: true, opacity: 0.16,
-        blending: THREE.AdditiveBlending, depthWrite: false,
+        vertexColors: true, transparent: true, opacity: 0.22, depthWrite: false,
       })
     );
     this.wireframe.frustumCulled = false;
@@ -419,26 +618,48 @@ export class NetScene {
     this.denseGroup.add(this.wireframe);
   }
 
+  /** Canvas-backed text sprite; `lines` are drawn centered at their `y`. */
+  private textSprite(
+    lines: { text: string; font: string; fill: string; y: number }[],
+    w: number,
+    h: number,
+    scaleX: number
+  ): THREE.Sprite {
+    const cv = document.createElement("canvas");
+    cv.width = w;
+    cv.height = h;
+    const ctx = cv.getContext("2d")!;
+    ctx.textAlign = "center";
+    for (const l of lines) {
+      ctx.font = l.font;
+      ctx.fillStyle = l.fill;
+      ctx.fillText(l.text, w / 2, l.y);
+    }
+    const sprite = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: new THREE.CanvasTexture(cv),
+        transparent: true,
+        depthWrite: false,
+      })
+    );
+    sprite.scale.set(scaleX, (scaleX * h) / w, 1);
+    return sprite;
+  }
+
   private addLabels(topology: ArchLayer[]) {
     for (const l of topology) {
       if (!(l.name in LAYER_Z)) continue;
-      const text =
+      const title =
         l.name === "head" ? "Q head 10×10" : `${l.name} ${l.out_shape.join("×")}`;
-      const cv = document.createElement("canvas");
-      cv.width = 256;
-      cv.height = 48;
-      const ctx = cv.getContext("2d")!;
-      ctx.font = "24px system-ui, sans-serif";
-      ctx.fillStyle = "#898781";
-      ctx.textAlign = "center";
-      ctx.fillText(text, 128, 32);
-      const tex = new THREE.CanvasTexture(cv);
-      const sprite = new THREE.Sprite(
-        new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false })
+      const sprite = this.textSprite(
+        [
+          { text: title, font: "26px system-ui, sans-serif", fill: "#c3c2b7", y: 30 },
+          { text: LAYER_ROLES[l.name] ?? "", font: "19px system-ui, sans-serif", fill: "#898781", y: 60 },
+        ],
+        512, 80, 12
       );
-      sprite.scale.set(9, 1.7, 1);
       const yTop = l.name === "fc1" ? 8.5 : l.name === "head" ? 10 : 8;
-      sprite.position.set(0, -yTop - 2, LAYER_Z[l.name]);
+      sprite.position.set(0, -yTop - 2.4, LAYER_Z[l.name]);
       this.scene.add(sprite);
     }
   }
@@ -448,7 +669,7 @@ export class NetScene {
   setStep(step: Viz3DStep, action: number) {
     this.lastStep = step;
     this.lastAction = action;
-    if (this.built) this.applyStep();
+    if (this.built) this.applyStep(true);
   }
 
   setOptions(o: SceneOptions) {
@@ -456,10 +677,13 @@ export class NetScene {
     this.opts = { ...o };
     if (this.wireframe) this.wireframe.visible = o.weightWireframe;
     if (focusChanged) this.applyFocus();
-    if (this.lastStep && this.built) this.applyStep(); // re-filter edges
+    this.clearSticky(); // selection params changed — old grace would fight the new filter
+    if (this.lastStep && this.built) this.applyStep(false); // re-filter edges
   }
 
-  private applyStep() {
+  /** advance=true on a new step (hysteresis clock ticks); false on re-filters
+   *  of the same data (option changes, focus clicks, late static payload). */
+  private applyStep(advance = false) {
     const step = this.lastStep!;
     const gradMode = this.opts.mode === "gradients" && !!step.grads;
 
@@ -478,16 +702,28 @@ export class NetScene {
       this.actionMarker.visible = true;
     }
 
-    const conv3 = this.planes.find((p) => p.name === "conv3");
-    if (conv3 && this.fc1 && this.edgeC3F) {
-      const m = gradMode ? step.grads!.conv3_fc1 : step.contrib.conv3_fc1;
-      this.updateEdges(this.edgeC3F, m, conv3.centers, this.fc1.positions, gradMode);
-    }
+    // fc1->head first: when a head node is focused, its surviving edges
+    // decide which fc1 units the conv3->fc1 set is traced back to
+    let fc1Allowed: Set<number> | null = null;
     if (this.fc1 && this.head && this.edgeF1H) {
       const m = gradMode ? step.grads!.fc1_head : step.contrib.fc1_head;
       // matrix is (target=head j, source=fc1 i) — flag transposed layout
-      this.updateEdges(this.edgeF1H, m, this.fc1.positions, this.head.positions, gradMode, true);
+      const picks = this.updateEdges(
+        this.edgeF1H, m, this.fc1.positions, this.head.positions,
+        gradMode, true, this.focusHead, null, advance
+      );
+      if (this.focusHead >= 0) fc1Allowed = new Set(picks.map((p) => p.s));
     }
+    const conv3 = this.planes.find((p) => p.name === "conv3");
+    if (conv3 && this.fc1 && this.edgeC3F) {
+      const m = gradMode ? step.grads!.conv3_fc1 : step.contrib.conv3_fc1;
+      this.updateEdges(
+        this.edgeC3F, m, conv3.centers, this.fc1.positions,
+        gradMode, false, -1, fc1Allowed, advance
+      );
+    }
+    this.updateFocusLabel();
+    this.onStats?.((this.edgeC3F?.count ?? 0) + (this.edgeF1H?.count ?? 0));
   }
 
   /** Feature-map plane: each texel = that cell's pre-ReLU activation,
@@ -495,6 +731,7 @@ export class NetScene {
    *  |post-ReLU activation| (inference) or per-map |grad| mass (gradients). */
   private updatePlanes(layer: PlaneLayer, t: Q8Tensor, gradMags?: Q8Tensor) {
     const vals = decodeQ8(t); // (n, 10, 10), values in [-scale, scale]
+    layer.values = vals; // kept for the hover readout
     const inv = t.scale > 0 ? 1 / t.scale : 1;
     const frameVals = new Float32Array(layer.n);
     for (let m = 0; m < layer.n; m++) {
@@ -536,6 +773,7 @@ export class NetScene {
    *  for the head, sign of Q). Brightness and size = |value| / layer max. */
   private updateNodes(layer: NodeLayer, t: Q8Tensor) {
     const vals = decodeQ8(t);
+    layer.values = vals; // kept for the hover readout
     const inv = t.scale > 0 ? 1 / t.scale : 1;
     const color = new THREE.Color();
     for (let i = 0; i < layer.n; i++) {
@@ -554,18 +792,27 @@ export class NetScene {
     if (layer.mesh.instanceColor) layer.mesh.instanceColor.needsUpdate = true;
   }
 
-  /** Select edges (top-k per target above threshold, or threshold-only in
-   *  show-all) and bind: line/particle color = sign×magnitude of the actual
-   *  contribution, particle size & speed = its magnitude, direction
-   *  source→target in inference and reversed in gradient mode. */
+  /** Select edges — per-target top-k intersected with a global strongest-N
+   *  budget (rank-based, so density stays stable whether the matrix is flat
+   *  or spiky) — and bind: line width & brightness = the actual
+   *  |contribution|, particle size & speed = its magnitude, direction
+   *  source→target in inference and reversed in gradient mode.
+   *
+   *  Selection (never values) has hysteresis: an edge must miss the cut
+   *  HYST_MISSES consecutive steps before it drops, and while in grace it
+   *  renders its *current* true value — a contribution that hits zero
+   *  (ReLU-dead source) still vanishes instantly. */
   private updateEdges(
     set: EdgeSet,
     t: Q8Tensor,
     srcPos: Float32Array,
     dstPos: Float32Array,
-    reverse: boolean,
-    targetMajor = false // true when matrix rows are targets (fc1_head)
-  ) {
+    reverse: boolean,       // gradient mode: particles flow target→source
+    targetMajor: boolean,   // true when matrix rows are targets (fc1_head)
+    focusTarget: number,    // >= 0: render only edges into this target
+    targetSet: Set<number> | null, // restrict targets (focused path tracing)
+    advance: boolean        // new step (hysteresis ticks) vs re-filter
+  ): EdgePick[] {
     const m = decodeQ8(t);
     const [d0, d1] = t.shape; // src-major: (nS, nT); target-major: (nT, nS)
     const nS = targetMajor ? d1 : d0;
@@ -573,19 +820,21 @@ export class NetScene {
     const val = targetMajor
       ? (s: number, tt: number) => m[tt * nS + s]
       : (s: number, tt: number) => m[s * nT + tt];
-    const thrAbs = this.opts.threshold * (t.scale || 1);
-    const k = this.opts.showAll ? Infinity : this.opts.k;
+    const noiseAbs = NOISE_FRAC * (t.scale || 1);
+    const k = this.opts.showAll ? Infinity : focusTarget >= 0 ? FOCUS_K : this.opts.k;
+    const budget = this.opts.showAll ? MAX_EDGES : Math.min(this.opts.topN, MAX_EDGES);
 
     // top-k per target neuron by |contribution|
-    type Pick = { s: number; t: number; v: number };
-    let picks: Pick[] = [];
-    const kb: Pick[] = [];
+    let picks: EdgePick[] = [];
+    const kb: EdgePick[] = [];
     for (let tt = 0; tt < nT; tt++) {
+      if (focusTarget >= 0 && tt !== focusTarget) continue;
+      if (targetSet && !targetSet.has(tt)) continue;
       kb.length = 0;
       for (let s = 0; s < nS; s++) {
         const v = val(s, tt);
         const a = Math.abs(v);
-        if (a < thrAbs || a === 0) continue;
+        if (a < noiseAbs) continue;
         if (kb.length < k || k === Infinity) {
           kb.push({ s, t: tt, v });
         } else {
@@ -597,9 +846,35 @@ export class NetScene {
       }
       picks.push(...kb);
     }
-    if (picks.length > MAX_EDGES) {
+    // global budget: keep only the strongest edges across the whole matrix
+    if (picks.length > budget) {
       picks.sort((a, b) => Math.abs(b.v) - Math.abs(a.v));
-      picks = picks.slice(0, MAX_EDGES);
+      picks = picks.slice(0, budget);
+    }
+
+    if (advance) {
+      const fresh = new Set<number>();
+      for (const p of picks) fresh.add(p.t * nS + p.s);
+      for (const [key, misses] of set.sticky) {
+        if (fresh.has(key)) continue;
+        const s = key % nS;
+        const tt = (key - s) / nS;
+        const filtered =
+          (focusTarget >= 0 && tt !== focusTarget) ||
+          (targetSet !== null && !targetSet.has(tt));
+        const v = filtered ? 0 : val(s, tt);
+        if (filtered || misses + 1 >= HYST_MISSES || Math.abs(v) < noiseAbs) {
+          set.sticky.delete(key);
+          continue;
+        }
+        set.sticky.set(key, misses + 1);
+        picks.push({ s, t: tt, v });
+      }
+      for (const key of fresh) set.sticky.set(key, 0);
+      if (picks.length > MAX_EDGES) {
+        picks.sort((a, b) => Math.abs(b.v) - Math.abs(a.v));
+        picks = picks.slice(0, MAX_EDGES);
+      }
     }
 
     const inv = t.scale > 0 ? 1 / t.scale : 1;
@@ -608,30 +883,132 @@ export class NetScene {
       const b = reverse ? srcPos.subarray(p.s * 3, p.s * 3 + 3) : dstPos.subarray(p.t * 3, p.t * 3 + 3);
       const mn = Math.min(1, Math.abs(p.v) * inv);
       const c = diverge(Math.sign(p.v) * Math.max(mn, 0.2), this.tmp);
-      // line: dimmed by magnitude
+      // line: width and brightness follow the magnitude
       set.linePos.set(a, e * 6);
       set.linePos.set(b, e * 6 + 3);
-      const lr = c.r * (0.2 + 0.6 * mn), lg = c.g * (0.2 + 0.6 * mn), lb = c.b * (0.2 + 0.6 * mn);
+      const lr = c.r * (0.3 + 0.7 * mn), lg = c.g * (0.3 + 0.7 * mn), lb = c.b * (0.3 + 0.7 * mn);
       set.lineCol.set([lr, lg, lb, lr, lg, lb], e * 6);
+      set.lineWidth[e] = 0.03 + 0.25 * mn; // world units
       // particle: size & speed proportional to the real contribution
       set.pStart.set(a, e * 3);
       set.pEnd.set(b, e * 3);
       set.pCol.set([c.r, c.g, c.b], e * 3);
-      set.pSize[e] = 2.2 + 8.5 * mn;
+      set.pSize[e] = 1.8 + 3.2 * mn;
       set.pSpeed[e] = 0.15 + 0.85 * mn;
       set.pPhase[e] = (e * 0.618034) % 1; // deterministic de-sync, not data
     });
+    // zero the stale tail so the raycaster can't hit ghost segments
+    if (picks.length < set.count) set.linePos.fill(0, picks.length * 6, set.count * 6);
     set.count = picks.length;
+    set.meta = picks;
+    set.grad = reverse;
 
-    const lg = set.lines.geometry;
-    (lg.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
-    (lg.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
-    lg.setDrawRange(0, picks.length * 2);
+    set.linePosBuf.needsUpdate = true;
+    set.lineColBuf.needsUpdate = true;
+    set.lineWidthAttr.needsUpdate = true;
+    (set.lines.geometry as LineSegmentsGeometry).instanceCount = picks.length;
     const pg = set.points.geometry;
     for (const name of ["position", "aEnd", "aColor", "aSize", "aSpeed", "aPhase"]) {
       (pg.getAttribute(name) as THREE.BufferAttribute).needsUpdate = true;
     }
     pg.setDrawRange(0, picks.length);
+    return picks;
+  }
+
+  // -- hover readout & click-to-trace ----------------------------------------
+
+  private clearSticky() {
+    this.edgeC3F?.sticky.clear();
+    this.edgeF1H?.sticky.clear();
+  }
+
+  private pickAt(): THREE.Intersection | null {
+    this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+    const targets: THREE.Object3D[] = [];
+    if (this.denseGroup.visible) {
+      if (this.fc1) targets.push(this.fc1.mesh);
+      if (this.head) targets.push(this.head.mesh);
+      if (this.edgeC3F && this.edgeC3F.count > 0) targets.push(this.edgeC3F.lines);
+      if (this.edgeF1H && this.edgeF1H.count > 0) targets.push(this.edgeF1H.lines);
+    }
+    for (const p of this.planes) if (p.group.visible) targets.push(...p.meshes);
+    return this.raycaster.intersectObjects(targets, false)[0] ?? null;
+  }
+
+  private updateHover() {
+    const hit = this.lastStep ? this.pickAt() : null;
+    const text = hit ? this.describe(hit) : null;
+    if (!text) {
+      this.tooltip.style.display = "none";
+      return;
+    }
+    this.tooltip.textContent = text;
+    this.tooltip.style.display = "block";
+    this.tooltip.style.left = `${this.pointerPx.x + 14}px`;
+    this.tooltip.style.top = `${this.pointerPx.y + 12}px`;
+  }
+
+  /** The exact number behind whatever the pointer is on. */
+  private describe(hit: THREE.Intersection): string | null {
+    if (this.head && hit.object === this.head.mesh && hit.instanceId !== undefined) {
+      const i = hit.instanceId;
+      const chosen = i === this.lastAction ? " · chosen action" : "";
+      return `Q(${cellLabel(i)}) = ${fmt(this.head.values[i])}${chosen}`;
+    }
+    if (this.fc1 && hit.object === this.fc1.mesh && hit.instanceId !== undefined) {
+      const i = hit.instanceId;
+      const v = this.fc1.values[i];
+      return `fc1 #${i} · pre-act ${fmt(v)} ${v > 0 ? "(fired)" : "(ReLU-suppressed)"}`;
+    }
+    const ud = hit.object.userData as { plane?: string; map?: number };
+    if (ud.plane !== undefined && ud.map !== undefined && hit.uv) {
+      const layer = this.planes.find((p) => p.name === ud.plane);
+      if (!layer) return null;
+      const col = Math.min(9, Math.floor(hit.uv.x * 10));
+      const row = 9 - Math.min(9, Math.floor(hit.uv.y * 10)); // texture row 0 = board bottom
+      const v = layer.values[ud.map * 100 + row * 10 + col];
+      return ud.plane === "input"
+        ? `input · ${CHANNEL_NAMES[ud.map] ?? `ch ${ud.map}`} · ${cellLabel(row * 10 + col)} = ${fmt(v)}`
+        : `${ud.plane} map ${ud.map} · ${cellLabel(row * 10 + col)} · pre-ReLU ${fmt(v)}`;
+    }
+    for (const set of [this.edgeC3F, this.edgeF1H]) {
+      if (!set || hit.object !== set.lines) continue;
+      const idx = hit.faceIndex ?? -1;
+      const p = idx >= 0 && idx < set.count ? set.meta[idx] : undefined;
+      if (!p) return null;
+      const c3f = set === this.edgeC3F;
+      const src = c3f ? `conv3 map ${p.s}` : `fc1 #${p.s}`;
+      const dst = c3f ? `fc1 #${p.t}` : `Q(${cellLabel(p.t)})`;
+      return set.grad
+        ? `${src} ← ${dst} · ${c3f ? "Σ|∂L/∂W1|" : "∂L/∂W2"} = ${fmt(p.v)}`
+        : `${src} → ${dst} · ${c3f ? "Σ relu(a)·w" : "relu(a)·w"} = ${fmt(p.v)}`;
+    }
+    return null;
+  }
+
+  private handleClick() {
+    if (!this.built) return;
+    const hit = this.pickAt();
+    let next = -1; // clicking anything but a head node clears the focus
+    if (this.head && hit && hit.object === this.head.mesh && hit.instanceId !== undefined) {
+      next = hit.instanceId === this.focusHead ? -1 : hit.instanceId; // re-click toggles off
+    }
+    if (next === this.focusHead) return;
+    this.focusHead = next;
+    this.clearSticky();
+    if (this.lastStep) this.applyStep(false);
+    else this.updateFocusLabel();
+  }
+
+  private updateFocusLabel() {
+    if (this.focusHead < 0 || !this.head) {
+      this.focusLabel.style.display = "none";
+      return;
+    }
+    this.focusLabel.textContent =
+      `Q(${cellLabel(this.focusHead)}) = ${fmt(this.head.values[this.focusHead])}` +
+      ` — showing only its inputs · click empty space to clear`;
+    this.focusLabel.style.display = "block";
   }
 
   // -- focus / level of detail ------------------------------------------------

@@ -18,24 +18,47 @@ function cellName(action: number | undefined): string {
   return `${"ABCDEFGHIJ"[action % 10]}${Math.floor(action / 10) + 1}`;
 }
 
+const OPTS_KEY = "battleship.viz3d.options.v2";
+
+function loadOptions(): SceneOptions {
+  try {
+    const raw = localStorage.getItem(OPTS_KEY);
+    if (raw) return { ...DEFAULT_OPTIONS, ...(JSON.parse(raw) as Partial<SceneOptions>) };
+  } catch {
+    /* corrupted or unavailable storage -> defaults */
+  }
+  return { ...DEFAULT_OPTIONS };
+}
+
 export default function NetworkViz3D({ payload, mode, staticKey }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<NetScene | null>(null);
   const skipCounter = useRef(0);
-  const [opts, setOpts] = useState<SceneOptions>({ ...DEFAULT_OPTIONS });
+  const [opts, setOpts] = useState<SceneOptions>(loadOptions);
   const [clientEvery, setClientEvery] = useState(1);
   const [backendEvery, setBackendEvery] = useState(1);
   const [lastBound, setLastBound] = useState<string>("");
+  const [edgeCount, setEdgeCount] = useState(0);
 
   // scene lifecycle
   useEffect(() => {
     const scene = new NetScene(mountRef.current!);
+    scene.onStats = setEdgeCount;
     sceneRef.current = scene;
     return () => {
       scene.dispose();
       sceneRef.current = null;
     };
   }, []);
+
+  // the tuned panel settings survive a reload
+  useEffect(() => {
+    try {
+      localStorage.setItem(OPTS_KEY, JSON.stringify(opts));
+    } catch {
+      /* private mode / storage full — settings just won't persist */
+    }
+  }, [opts]);
 
   // static payload (topology + head weights): once per model change
   useEffect(() => {
@@ -105,12 +128,13 @@ export default function NetworkViz3D({ payload, mode, staticKey }: Props) {
           onChange={(e) => set({ k: Number(e.target.value) })} style={{ width: 90 }}
         />
         <span className="hint">{opts.showAll ? "—" : opts.k}</span>
-        <label style={{ minWidth: 0 }}>min |signal|</label>
+        <label style={{ minWidth: 0 }}>edge budget</label>
         <input
-          type="range" min={0} max={40} value={Math.round(opts.threshold * 100)}
-          onChange={(e) => set({ threshold: Number(e.target.value) / 100 })} style={{ width: 90 }}
+          type="range" min={32} max={1024} step={32} value={opts.topN} disabled={opts.showAll}
+          onChange={(e) => set({ topN: Number(e.target.value) })} style={{ width: 90 }}
         />
-        <span className="hint">{Math.round(opts.threshold * 100)}% of max</span>
+        <span className="hint">{opts.showAll ? "—" : opts.topN}</span>
+        <span className="hint">· {edgeCount} shown</span>
         <label className="hint">
           <input
             type="checkbox" checked={opts.showAll}
@@ -166,9 +190,38 @@ export default function NetworkViz3D({ payload, mode, staticKey }: Props) {
         <span className="legend-key"><span className="legend-swatch" style={{ border: "2px solid #fff", background: "transparent" }} /> chosen action</span>
       </div>
       <div className="hint" style={{ marginTop: 4 }}>
-        Node size/brightness = |activation| of this pass · particle size &amp; speed = |activation×weight|
-        contribution (gradient mode: |∂L/∂W|, reversed direction) · drag to orbit, wheel to zoom,
-        right-drag to pan.
+        Node size/brightness = |activation| of this pass · line width &amp; particle size/speed =
+        |activation×weight| contribution (gradient mode: |∂L/∂W|, reversed direction) · hover any
+        node, cell or connection for its exact value · click a Q node to isolate its inputs ·
+        drag to orbit, wheel to zoom, right-drag to pan.
+      </div>
+
+      <div className="viz3d-explain">
+        <div className="viz3d-explain-title">How to read this network (left → right)</div>
+        <div>
+          <b>input</b> — what the agent knows: one 10×10 plane per channel — the cells it
+          hasn&apos;t fired at yet, its hits, and its misses.
+        </div>
+        <div>
+          <b>conv1 → conv3</b> — stacks of 3×3 convolution maps. Each small square is one learned
+          detector, lighting up where its pattern (say, a line of hits) appears on the board.
+          Orange = fired; blue = negative pre-ReLU, so ReLU zeroes it and it contributes nothing
+          downstream.
+        </div>
+        <div>
+          <b>fc1</b> — conv3&apos;s 64 maps × 100 cells are flattened and mixed into 512
+          whole-board features; one sphere per unit.
+        </div>
+        <div>
+          <b>Q head</b> — one node per board cell, laid out exactly like the board. Each value is
+          the net&apos;s predicted return for firing at that cell; the white ring marks the argmax
+          — the move actually taken.
+        </div>
+        <div>
+          <b>edges &amp; pulses</b> — the strongest activation×weight products flowing in this
+          pass (width and pulse speed scale with the contribution). Hover anything for its exact
+          number; click a Q node to trace where its value came from.
+        </div>
       </div>
     </div>
   );
